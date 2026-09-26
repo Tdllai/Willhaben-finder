@@ -157,7 +157,10 @@ def is_match(ad, cfg):
         if not any(re.search(r"(?<![a-zäöüß])" + re.escape(w.lower()) + r"(?![a-zäöüß])", title)
                    for w in cfg["title_must_contain_one_of"]):
             return False, "title"
-    for w in cfg.get("exclude_words", []):
+    for w in cfg.get("exclude_title_words", []):      # furniture/accessories: title only
+        if w.lower() in title:
+            return False, f"title-excluded:{w}"
+    for w in cfg.get("exclude_words", []):            # defects: title + description
         if w.lower() in text:
             return False, f"excluded:{w}"
 
@@ -202,6 +205,16 @@ def get_chat_id(state):
     return None
 
 
+def local_time(s):
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("Europe/Vienna")).strftime("%d.%m. %H:%M")
+    except Exception:
+        return str(s)
+
+
 def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -213,7 +226,7 @@ def send_ad(chat_id, ad):
         price = f"💶 {ad['price']:.0f} €"
     place = " ".join(x for x in [ad["postcode"], ad["location"]] if x)
     caption = (f"🆕 <b>{esc(ad['title'])}</b>\n{price}\n📍 {esc(place)}\n"
-               f"🕒 {esc(ad['published'])}\n\n<a href=\"{ad['url']}\">آگهی رو باز کن</a>")
+               f"🕒 {esc(local_time(ad['published']))}\n\n<a href=\"{ad['url']}\">آگهی رو باز کن</a>")
     if ad["image"]:
         try:
             telegram("sendPhoto", {"chat_id": chat_id, "photo": ad["image"],
