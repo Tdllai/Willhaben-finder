@@ -2,7 +2,7 @@ name: willhaben-check
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,9 +15,16 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+
+      - name: Load data
+        run: |
+          rm -rf data
+          if git fetch -q --depth 1 origin data; then
+            git checkout FETCH_HEAD -- data || true
+          fi
 
       - name: Check
         run: python3 willhaben_bot.py
@@ -26,9 +33,14 @@ jobs:
           BOT_PASSWORD: ${{ secrets.BOT_PASSWORD }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
 
-      - name: Save
+      - name: Save data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add data 2>/dev/null || true
-          git diff --cached --quiet || (git commit -m "update" && git push)
+          [ -d data ] || exit 0
+          mkdir -p /tmp/out && cp -r data /tmp/out/
+          cd /tmp/out
+          git init -q -b data
+          git add data
+          git -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm data
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
