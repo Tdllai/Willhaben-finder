@@ -154,8 +154,12 @@ def is_match(ad, cfg):
     full = f"{text} {ad['all_text']} {ad['price_text']}".lower()
 
     if cfg.get("title_must_contain_one_of"):
-        if not any(re.search(r"(?<![a-zäöüß])" + re.escape(w.lower()) + r"(?![a-zäöüß])", title)
-                   for w in cfg["title_must_contain_one_of"]):
+        def hit(w):
+            w = w.lower()
+            if len(w) <= 3:   # tv, lg, tcl ... must be a separate word
+                return re.search(r"(?<![a-zäöüß])" + re.escape(w) + r"(?![a-zäöüß])", title)
+            return w in title  # longer words may sit inside compounds (Einbaukühlschrank)
+        if not any(hit(w) for w in cfg["title_must_contain_one_of"]):
             return False, "title"
     for w in cfg.get("exclude_title_words", []):      # furniture/accessories: title only
         if w.lower() in title:
@@ -225,7 +229,8 @@ def send_ad(chat_id, ad):
     else:
         price = f"💶 {ad['price']:.0f} €"
     place = " ".join(x for x in [ad["postcode"], ad["location"]] if x)
-    caption = (f"🆕 <b>{esc(ad['title'])}</b>\n{price}\n📍 {esc(place)}\n"
+    label = ad.get("label", "🆕")
+    caption = (f"{label} <b>{esc(ad['title'])}</b>\n{price}\n📍 {esc(place)}\n"
                f"🕒 {esc(local_time(ad['published']))}\n\n<a href=\"{ad['url']}\">آگهی رو باز کن</a>")
     if ad["image"]:
         try:
@@ -245,36 +250,110 @@ def load_config():
     return load_json(CONFIG_FILE, {})
 
 
+def categories(cfg):
+    """Old single-item configs become one category; new configs have a 'categories' list.
+    Settings outside 'categories' are shared defaults for every category."""
+    if "categories" not in cfg:
+        return [dict(cfg, name=cfg.get("name", "item"), label=cfg.get("label", "🆕"))]
+    shared = {k: v for k, v in cfg.items() if k != "categories"}
+    out = []
+    for c in cfg["categories"]:
+        merged = dict(shared)
+        for k, v in c.items():
+            if k in ("exclude_words",) and k in shared:   # shared defect words + extra ones
+                merged[k] = list(shared[k]) + list(v)
+            else:
+                merged[k] = v
+        out.append(merged)
+    return out
+
+
 def main():
-    if not TOKEN:
-        sys.exit("TELEGRAM_TOKEN is missing. Add it as a GitHub secret.")
     if not PASSWORD:
         sys.exit("BOT_PASSWORD is missing. Add it as a GitHub secret.")
     cfg = load_config()
+    if cfg.get("telegram", True) and not TOKEN:
+        sys.exit("TELEGRAM_TOKEN is missing. Add it as a GitHub secret.")
+    cats = categories(cfg)
     state = load_secret_json(STATE_FILE, {})
     old_state = json.dumps(state, sort_keys=True)
     seen_list = list(state.get("seen", []))
     seen = set(seen_list)
-    first_run = not state.get("initialised")
+    started = set(state.get("started", []))
+    if state.get("initialised") and not started and "categories" not in cfg:
+        started = {cats[0]["name"]}
+    if state.get("initialised") and not state.get("started"):
+        # upgrading from the single-item bot: its category was already running
+        started |= {c["name"] for c in cats if c["name"] in ("تلویزیون", "tv", "item")}
 
-    chat_id = get_chat_id(state)
-    if not chat_id:
-        print("No chat yet: open your bot in Telegram and press START, then run again.")
-        return
+    global telegram
+    if cfg.get("telegram", True):
+        chat_id = get_chat_id(state)
+        if not chat_id:
+            print("No chat yet: open your bot in Telegram and press START, then run again.")
+            return
+    else:                       # Telegram switched off: Claude does all the messaging
+        chat_id = None
+        telegram = lambda method, params: {}
 
-    all_ads, errors = {}, []
-    for i, url in enumerate(cfg.get("search_urls", []), 1):
-        try:
-            ads = parse_ads(http_get(url))
-            print(f"search {i}: {len(ads)} ads")          # no URLs/keywords: logs are public
-            for ad in ads:
-                all_ads[ad["id"]] = ad
-            time.sleep(2)
-        except Exception as e:
-            errors.append(f"search {i}: {type(e).__name__}: {e}")
-            print("ERROR", errors[-1][:200])
+    total_checked, total_new, total_sent, any_ok, errors = 0, [], 0, False, []
+    stats = {}
+    for ci, cat in enumerate(cats, 1):
+        ads_by_id = {}
+        for i, url in enumerate(cat.get("search_urls", []), 1):
+            try:
+                ads = parse_ads(http_get(url))
+                print(f"cat {ci} search {i}: {len(ads)} ads")   # no URLs/keywords: logs are public
+                for ad in ads:
+                    ads_by_id[ad["id"]] = ad
+                any_ok = True
+                time.sleep(2)
+            except Exception as e:
+                errors.append(f"cat {ci} search {i}: {type(e).__name__}: {e}")
+                print("ERROR", errors[-1][:200])
+        total_checked += len(ads_by_id)
 
-    if errors and not all_ads:
+        new_matches = []
+        for ad in ads_by_id.values():
+            key = f"{cat['name']}:{ad['id']}"
+            if key in seen or (ad["id"] in seen and cat["name"] in started):
+                continue      # plain ids = seen by the older single-item bot
+            seen.add(key)
+            seen_list.append(key)
+            ok, reason = is_match(ad, cat)
+            if DEBUG:
+                print(f"  [{reason:>14}] {ad['price']} | {ad['postcode']} | {ad['title'][:60]}")
+            if ok:
+                ad["label"] = cat.get("label", "🆕")
+                ad["category"] = cat["name"]
+                new_matches.append(ad)
+
+        collect_all = cat.get("collect_all", False)   # deals mode: store for Claude, no per-ad message
+        to_send = [] if collect_all else new_matches
+        if cat["name"] not in started and ads_by_id:
+            if collect_all:
+                telegram("sendMessage", {"chat_id": chat_id,
+                         "text": f"🔎 جمع‌کردن آگهی‌های «{cat['name']}» شروع شد. کلود هر دو ساعت "
+                                 f"بهترین معامله‌ها رو بررسی می‌کنه و خبرت می‌کنه."})
+            else:
+                to_send = new_matches[: cat.get("first_run_samples", 3)]
+                telegram("sendMessage", {"chat_id": chat_id,
+                         "text": f"🔎 جست‌وجوی «{cat['name']}» شروع شد. الان {len(new_matches)} آگهی مناسب "
+                                 f"پیدا کردم؛ {len(to_send)} تاش رو برای نمونه می‌فرستم. از این به بعد فقط آگهی‌های تازه میاد."})
+            started.add(cat["name"])
+        # overflow = almost everything on the pages was new -> we may be missing ads between runs
+        stats[cat["name"]] = {"checked": len(ads_by_id), "new": len(new_matches),
+                              "overflow": bool(ads_by_id) and len(new_matches) >= 0.9 * len(ads_by_id)}
+        for ad in to_send:
+            try:
+                send_ad(chat_id, ad)
+                time.sleep(1)
+            except Exception as e:
+                print("send failed:", type(e).__name__)
+        total_new += new_matches
+        total_sent += len(to_send)
+
+    if errors and not any_ok:
         state["fail_count"] = state.get("fail_count", 0) + 1
         if state["fail_count"] in (3, 20):
             telegram("sendMessage", {"chat_id": chat_id,
@@ -283,46 +362,27 @@ def main():
         return
     state["fail_count"] = 0
 
-    new_matches = []
-    for ad in all_ads.values():
-        if ad["id"] in seen:
-            continue
-        seen.add(ad["id"])
-        seen_list.append(ad["id"])
-        ok, reason = is_match(ad, cfg)
-        if DEBUG:
-            print(f"  [{reason:>14}] {ad['price']} | {ad['postcode']} | {ad['title'][:60]}")
-        if ok:
-            new_matches.append(ad)
-
-    to_send = new_matches
-    if first_run:
-        to_send = new_matches[: cfg.get("first_run_samples", 3)]
-        telegram("sendMessage", {"chat_id": chat_id,
-                 "text": f"🔎 شروع شد. الان {len(new_matches)} آگهی مناسب پیدا کردم؛ "
-                         f"{len(to_send)} تاش رو برای نمونه می‌فرستم. از این به بعد فقط آگهی‌های تازه میاد."})
-    for ad in to_send:
-        try:
-            send_ad(chat_id, ad)
-            time.sleep(1)
-        except Exception as e:
-            print("send failed:", type(e).__name__)
-
-    if new_matches:
+    if total_new:
         history = load_secret_json(MATCHES_FILE, [])
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        for ad in new_matches:
-            item = {k: ad[k] for k in ("id", "title", "body", "price", "postcode",
-                                        "location", "url", "image", "published")}
+        for ad in total_new:
+            item = {k: ad.get(k) for k in ("id", "category", "title", "price", "postcode",
+                                            "location", "url", "image", "published")}
+            item["body"] = (ad.get("body") or "")[:400]
             item["found"] = now
             history.append(item)
-        save_secret_json(MATCHES_FILE, history[-200:])
+        keep_h = cfg.get("keep_hours", 18)
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - keep_h * 3600))
+        history = [h for h in history if h.get("found", "") >= cutoff]
+        save_secret_json(MATCHES_FILE, history[-cfg.get("keep_max", 4000):])
 
-    state["seen"] = seen_list[-3000:]
+    state["seen"] = seen_list[-cfg.get("seen_max", 5000):]
+    state["last_stats"] = stats
+    state["started"] = sorted(started)
     state["initialised"] = True
     if json.dumps(state, sort_keys=True) != old_state:   # only write (and commit) on change
         save_secret_json(STATE_FILE, state)
-    print(f"done: {len(all_ads)} ads checked, {len(new_matches)} new, {len(to_send)} sent")
+    print(f"done: {total_checked} ads checked, {len(total_new)} new, {total_sent} sent")
 
 
 if __name__ == "__main__":
