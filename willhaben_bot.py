@@ -148,18 +148,20 @@ def parse_ads(html):
     return ads
 
 
+def has_word(text, w):
+    w = w.lower()
+    if len(w) <= 3:   # short words (tv, lg, ps5...) must stand alone
+        return re.search(r"(?<![a-zäöüß0-9])" + re.escape(w) + r"(?![a-zäöüß0-9])", text) is not None
+    return w in text  # longer words may sit inside compounds
+
+
 def is_match(ad, cfg):
     text = f"{ad['title']} {ad['body']}".lower()
     title = ad["title"].lower()
     full = f"{text} {ad['all_text']} {ad['price_text']}".lower()
 
     if cfg.get("title_must_contain_one_of"):
-        def hit(w):
-            w = w.lower()
-            if len(w) <= 3:   # tv, lg, tcl ... must be a separate word
-                return re.search(r"(?<![a-zäöüß])" + re.escape(w) + r"(?![a-zäöüß])", title)
-            return w in title  # longer words may sit inside compounds (Einbaukühlschrank)
-        if not any(hit(w) for w in cfg["title_must_contain_one_of"]):
+        if not any(has_word(title, w) for w in cfg["title_must_contain_one_of"]):
             return False, "title"
     for w in cfg.get("exclude_title_words", []):      # furniture/accessories: title only
         if w.lower() in title:
@@ -167,6 +169,15 @@ def is_match(ad, cfg):
     for w in cfg.get("exclude_words", []):            # defects: title + description
         if w.lower() in text:
             return False, f"excluded:{w}"
+
+    if cfg.get("value_words") or cfg.get("new_words"):
+        valuable = any(has_word(title, w) for w in cfg.get("value_words", []))
+        brand_new = any(has_word(text, w) for w in cfg.get("new_words", []))
+        if not (valuable or brand_new):
+            return False, "no-value-sign"
+    min_price = cfg.get("min_price")
+    if min_price and ad["price"] not in (None, 0) and ad["price"] < min_price:
+        return False, "too-cheap"
 
     max_price = cfg.get("max_price")
     if max_price is not None:
@@ -300,17 +311,26 @@ def main():
     stats = {}
     for ci, cat in enumerate(cats, 1):
         ads_by_id = {}
-        for i, url in enumerate(cat.get("search_urls", []), 1):
+        urls = list(cat.get("search_urls", []))
+        paged = cat.get("paged_url")            # newest-first search, walked page by page
+        max_pages = cat.get("max_pages", 1)
+        if paged:
+            urls = [paged + (f"&page={p}" if p > 1 else "") for p in range(1, max_pages + 1)]
+        for i, url in enumerate(urls, 1):
             try:
                 ads = parse_ads(http_get(url))
-                print(f"cat {ci} search {i}: {len(ads)} ads")   # no URLs/keywords: logs are public
+                known = sum(1 for a in ads if f"{cat['name']}:{a['id']}" in seen)
+                print(f"cat {ci} page {i}: {len(ads)} ads, {known} already known")   # no URLs: logs are public
                 for ad in ads:
                     ads_by_id[ad["id"]] = ad
                 any_ok = True
                 time.sleep(2)
+                if paged and (not ads or known >= len(ads) * 0.5):
+                    break                      # reached listings we saw last time
             except Exception as e:
-                errors.append(f"cat {ci} search {i}: {type(e).__name__}: {e}")
+                errors.append(f"cat {ci} page {i}: {type(e).__name__}: {e}")
                 print("ERROR", errors[-1][:200])
+                break
         total_checked += len(ads_by_id)
 
         new_matches = []
